@@ -1,0 +1,481 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#if defined(ESP32)
+#include <esp_wifi.h>
+#endif
+
+#ifndef WIFI_SSID
+// #define WIFI_SSID "LAU5GOC-2.4GHz"
+// #define WIFI_SSID "NguyenDucDuy"
+// #define WIFI_SSID "DHSP-WIFI"
+// #define WIFI_SSID "iptime"
+#define WIFI_SSID "Phong 9"
+#endif
+
+#ifndef WIFI_PASSWORD
+// #define WIFI_PASSWORD "12345678"
+// #define WIFI_PASSWORD "dhsp280adv"
+// #define WIFI_PASSWORD "hcmue.edu.vn"
+#define WIFI_PASSWORD "12312312"
+#endif
+
+#define BOOT_BTN 0
+bool lastState = HIGH;
+
+#define SERVICE_UUID "71941c3b-9666-4bef-82f0-1099e4cbc99e"
+#define CHAR_SSID_UUID "8cbda693-fde4-49df-a2e9-1fd9ef3ac3d4"
+#define CHAR_PASS_UUID "bce09c25-d280-42f0-8b67-bcf162a445b2"
+#define CHAR_MQTT_UUID "dfb28fc6-a1ce-4b71-9480-c7d68a86d544"
+
+constexpr uint32_t kConnectTimeoutMs = 90000; // stop trying after 90 seconds
+constexpr uint32_t kRetryDelayMs = 1000;      // wait between status polls
+
+constexpr char kBleDeviceName[] = "ESP32";
+constexpr char kBleServiceUuid[] = "12345678-1234-5678-1234-56789abcdef0";
+constexpr char kBleCharacteristicUuid[] = "12345678-1234-5678-1234-56789abcdef1";
+
+bool waitForWiFi(const char *ssid, uint32_t timeoutMs);
+void scanAvailableNetworks();
+bool connectToWiFi(const char *ssid, const char *password);
+void setupBLE();
+void updateBleStatusCharacteristic(wl_status_t status);
+void printNetworkInfo();
+
+// static BLECharacteristic *g_statusCharacteristic = nullptr;
+static BLEServer *g_bleServer = nullptr;
+
+static BLECharacteristic *modelChar = nullptr;
+static BLECharacteristic *ssidChar = nullptr;
+static BLECharacteristic *passChar = nullptr;
+static BLECharacteristic *mqttChar = nullptr;
+
+class ServerCallbacks : public BLEServerCallbacks
+{
+public:
+  void onConnect(BLEServer *server) override
+  {
+    Serial.println("[BLE] Client connected");
+    // Keep advertising disabled while a client stays connected
+    server->getAdvertising()->stop();
+  }
+
+  void onDisconnect(BLEServer *server) override
+  {
+    Serial.println("[BLE] Client disconnected");
+    BLEDevice::startAdvertising();
+  }
+};
+
+static ServerCallbacks g_serverCallbacks;
+
+class ServerCharacteristicCallbacks : public BLECharacteristicCallbacks
+{
+  void onRead(BLECharacteristic *characteristic) override
+  {
+    Serial.println("[BLE] Characteristic read");
+  }
+
+  void onWrite(BLECharacteristic *characteristic) override
+  {
+    std::string value = characteristic->getValue();
+    Serial.print("[BLE] Characteristic written: ");
+    Serial.println(value.c_str());
+  }
+};
+
+const char *wifiStatusToString(wl_status_t status)
+{
+  switch (status)
+  {
+  case WL_NO_SHIELD:
+    return "NO_SHIELD";
+  case WL_IDLE_STATUS:
+    return "IDLE";
+  case WL_NO_SSID_AVAIL:
+    return "NO_SSID";
+  case WL_SCAN_COMPLETED:
+    return "SCAN_COMPLETED";
+  case WL_CONNECTED:
+    return "CONNECTED";
+  case WL_CONNECT_FAILED:
+    return "CONNECT_FAILED";
+  case WL_CONNECTION_LOST:
+    return "CONNECTION_LOST";
+  case WL_DISCONNECTED:
+    return "DISCONNECTED";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+#if defined(ESP32)
+const char *wifiDisconnectReasonToString(uint8_t reason)
+{
+  switch (reason)
+  {
+  case WIFI_REASON_UNSPECIFIED:
+    return "UNSPECIFIED";
+  case WIFI_REASON_AUTH_EXPIRE:
+    return "AUTH_EXPIRE";
+  case WIFI_REASON_AUTH_LEAVE:
+    return "AUTH_LEAVE";
+  case WIFI_REASON_ASSOC_EXPIRE:
+    return "ASSOC_EXPIRE";
+  case WIFI_REASON_ASSOC_TOOMANY:
+    return "ASSOC_TOOMANY";
+  case WIFI_REASON_NOT_AUTHED:
+    return "NOT_AUTHED";
+  case WIFI_REASON_NOT_ASSOCED:
+    return "NOT_ASSOCED";
+  case WIFI_REASON_ASSOC_LEAVE:
+    return "ASSOC_LEAVE";
+  case WIFI_REASON_ASSOC_NOT_AUTHED:
+    return "ASSOC_NOT_AUTHED";
+  case WIFI_REASON_DISASSOC_PWRCAP_BAD:
+    return "DISASSOC_PWRCAP_BAD";
+  case WIFI_REASON_DISASSOC_SUPCHAN_BAD:
+    return "DISASSOC_SUPCHAN_BAD";
+  case WIFI_REASON_IE_INVALID:
+    return "IE_INVALID";
+  case WIFI_REASON_MIC_FAILURE:
+    return "MIC_FAILURE";
+  case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    return "4WAY_HANDSHAKE_TIMEOUT";
+  case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT:
+    return "GROUP_KEY_UPDATE_TIMEOUT";
+  case WIFI_REASON_IE_IN_4WAY_DIFFERS:
+    return "IE_IN_4WAY_DIFFERS";
+  case WIFI_REASON_GROUP_CIPHER_INVALID:
+    return "GROUP_CIPHER_INVALID";
+  case WIFI_REASON_PAIRWISE_CIPHER_INVALID:
+    return "PAIRWISE_CIPHER_INVALID";
+  case WIFI_REASON_AKMP_INVALID:
+    return "AKMP_INVALID";
+  case WIFI_REASON_UNSUPP_RSN_IE_VERSION:
+    return "UNSUPP_RSN_IE_VERSION";
+  case WIFI_REASON_INVALID_RSN_IE_CAP:
+    return "INVALID_RSN_IE_CAP";
+  case WIFI_REASON_802_1X_AUTH_FAILED:
+    return "802_1X_AUTH_FAILED";
+  case WIFI_REASON_CIPHER_SUITE_REJECTED:
+    return "CIPHER_SUITE_REJECTED";
+  case WIFI_REASON_INVALID_PMKID:
+    return "INVALID_PMKID";
+  case WIFI_REASON_BEACON_TIMEOUT:
+    return "BEACON_TIMEOUT";
+  case WIFI_REASON_NO_AP_FOUND:
+    return "NO_AP_FOUND";
+  case WIFI_REASON_AUTH_FAIL:
+    return "AUTH_FAIL";
+  case WIFI_REASON_ASSOC_FAIL:
+    return "ASSOC_FAIL";
+  case WIFI_REASON_HANDSHAKE_TIMEOUT:
+    return "HANDSHAKE_TIMEOUT";
+  default:
+    return "UNKNOWN_REASON";
+  }
+}
+
+static volatile uint8_t g_lastDisconnectReason = WIFI_REASON_UNSPECIFIED;
+static volatile bool g_hasDisconnectReason = false;
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+  switch (event)
+  {
+#if defined(ARDUINO_EVENT_WIFI_STA_START)
+  case ARDUINO_EVENT_WIFI_STA_START:
+    Serial.println("[WiFi] Event: STA start");
+    break;
+  case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+    Serial.println("[WiFi] Event: STA connected to AP");
+    break;
+  case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+    Serial.print("[WiFi] Event: STA got IP ");
+    Serial.println(WiFi.localIP());
+    break;
+  case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+    g_lastDisconnectReason = info.wifi_sta_disconnected.reason;
+    g_hasDisconnectReason = true;
+    Serial.print("[WiFi] Event: STA disconnected, reason ");
+    Serial.print(wifiDisconnectReasonToString(g_lastDisconnectReason));
+    Serial.print(" (");
+    Serial.print(g_lastDisconnectReason);
+    Serial.println(")");
+    break;
+#else
+  case SYSTEM_EVENT_STA_START:
+    Serial.println("[WiFi] Event: STA start");
+    break;
+  case SYSTEM_EVENT_STA_CONNECTED:
+    Serial.println("[WiFi] Event: STA connected to AP");
+    break;
+  case SYSTEM_EVENT_STA_GOT_IP:
+    Serial.print("[WiFi] Event: STA got IP ");
+    Serial.println(WiFi.localIP());
+    break;
+  case SYSTEM_EVENT_STA_DISCONNECTED:
+    g_lastDisconnectReason = info.wifi_sta_disconnected.reason;
+    g_hasDisconnectReason = true;
+    Serial.print("[WiFi] Event: STA disconnected, reason ");
+    Serial.print(wifiDisconnectReasonToString(g_lastDisconnectReason));
+    Serial.print(" (");
+    Serial.print(g_lastDisconnectReason);
+    Serial.println(")");
+    break;
+#endif
+  default:
+    break;
+  }
+}
+#endif
+
+bool waitForWiFi(const char *ssid, uint32_t timeoutMs)
+{
+  Serial.print("[WiFi] Connecting to ");
+  Serial.print(ssid);
+  Serial.print(' ');
+
+  const uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs)
+  {
+    Serial.print('.');
+    delay(kRetryDelayMs);
+  }
+  Serial.println();
+
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void scanAvailableNetworks()
+{
+  Serial.println("[WiFi] Scanning available networks...");
+  const int networkCount = WiFi.scanNetworks();
+
+  if (networkCount < 0)
+  {
+    Serial.printf("[WiFi] Scan failed with error %d\n", networkCount);
+    return;
+  }
+
+  if (networkCount == 0)
+  {
+    Serial.println("[WiFi] No networks found.");
+    return;
+  }
+
+  Serial.printf("[WiFi] Found %d network%s:\n", networkCount, (networkCount == 1) ? "" : "s");
+  for (int i = 0; i < networkCount; ++i)
+  {
+    Serial.printf("  %2d: %-20s RSSI: %4d dBm  Channel: %2d  %s\n",
+                  i + 1,
+                  WiFi.SSID(i).c_str(),
+                  WiFi.RSSI(i),
+                  WiFi.channel(i),
+                  (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "OPEN" : "SECURED");
+    delay(10);
+  }
+  Serial.println("=======================");
+}
+
+void printNetworkInfo()
+{
+  Serial.println("===== WiFi status =====");
+  Serial.print("SSID: ");
+  Serial.println(WiFi.SSID());
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("Gateway: ");
+  Serial.println(WiFi.gatewayIP());
+  Serial.print("MAC: ");
+  Serial.println(WiFi.macAddress());
+  Serial.print("RSSI (dBm): ");
+  Serial.println(WiFi.RSSI());
+  Serial.println("=======================");
+}
+
+bool connectToWiFi(const char *ssid, const char *password)
+{
+  Serial.println("[WiFi] Starting connection");
+  WiFi.begin(ssid, password);
+
+#if defined(ESP32)
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_max_tx_power(44);
+#endif
+
+  const bool connected = waitForWiFi(ssid, kConnectTimeoutMs);
+
+  if (connected)
+  {
+    Serial.println("[WiFi] Connected successfully!");
+    printNetworkInfo();
+    return true;
+  }
+
+  Serial.println("[WiFi] Failed to connect.");
+  Serial.print("[WiFi] Status: ");
+  Serial.println(wifiStatusToString(WiFi.status()));
+#if defined(ESP32)
+  if (g_hasDisconnectReason)
+  {
+    Serial.print("[WiFi] Last disconnect reason: ");
+    Serial.print(wifiDisconnectReasonToString(g_lastDisconnectReason));
+    Serial.print(" (");
+    Serial.print(g_lastDisconnectReason);
+    Serial.println(')');
+  }
+  else
+  {
+    Serial.println("[WiFi] No disconnect reason event received yet.");
+  }
+#else
+  Serial.println("[WiFi] Detailed disconnect reason not available on this platform.");
+#endif
+
+  return false;
+}
+
+void setupBLE()
+{
+  Serial.println();
+  Serial.println("=== BLE setup ===");
+
+  BLEDevice::init(kBleDeviceName);
+
+  g_bleServer = BLEDevice::createServer();
+  g_bleServer->setCallbacks(&g_serverCallbacks);
+
+  // BLEService *service = g_bleServer->createService(SERVICE_UUID);
+  BLEService *service = g_bleServer->createService(BLEUUID((uint16_t)0x180A));
+
+  modelChar = service->createCharacteristic(
+      BLEUUID((uint16_t)0x2A24),
+      BLECharacteristic::PROPERTY_READ);
+
+  modelChar->setValue("ESP32 Model XYZ");
+
+  ssidChar = service->createCharacteristic(
+      CHAR_SSID_UUID,
+      BLECharacteristic::PROPERTY_WRITE);
+
+  passChar = service->createCharacteristic(
+      CHAR_PASS_UUID,
+      BLECharacteristic::PROPERTY_WRITE);
+
+  mqttChar = service->createCharacteristic(
+      CHAR_MQTT_UUID,
+      BLECharacteristic::PROPERTY_WRITE);
+
+  ssidChar->setValue("Phong 9");
+  passChar->setValue("12312312");
+  mqttChar->setValue("192.168.1.61");
+
+  ssidChar->setCallbacks(new ServerCharacteristicCallbacks());
+  passChar->setCallbacks(new ServerCharacteristicCallbacks());
+  mqttChar->setCallbacks(new ServerCharacteristicCallbacks());
+
+  // updateBleStatusCharacteristic(WiFi.status());
+
+  service->start();
+  delay(150);
+
+  BLEAdvertising *advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(service->getUUID());
+  advertising->setScanResponse(true);
+  advertising->setMinPreferred(0x06);
+  advertising->setMinPreferred(0x12);
+
+  BLEDevice::startAdvertising();
+  // advertising->start();
+
+  Serial.println("[BLE] Advertising started");
+}
+
+void updateBleStatusCharacteristic(wl_status_t status)
+{
+  if (ssidChar == nullptr)
+  {
+    return;
+  }
+
+  char buffer[32];
+  snprintf(buffer, sizeof(buffer), "WiFi: %s", wifiStatusToString(status));
+
+  const size_t length = strlen(buffer);
+  ssidChar->setValue(reinterpret_cast<uint8_t *>(buffer), length);
+
+  if (g_bleServer != nullptr && g_bleServer->getConnectedCount() > 0)
+  {
+    ssidChar->notify();
+  }
+}
+
+void setup()
+{
+  delay(5000);
+  Serial.begin(115200);
+  delay(100);
+
+  pinMode(BOOT_BTN, INPUT_PULLUP); // sử dụng internal pull-up
+  Serial.begin(115200);
+
+  Serial.println();
+  Serial.println("=== WiFi + BLE test ===");
+
+#if defined(ESP32)
+  WiFi.onEvent(onWiFiEvent);
+#endif
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true); // reset previous state
+  delay(100);
+
+  scanAvailableNetworks();
+  const bool wifiConnected = connectToWiFi(WIFI_SSID, WIFI_PASSWORD);
+
+  // setupBLE();
+
+  if (!wifiConnected)
+  {
+    Serial.println("[WiFi] Proceeding without an active connection.");
+  }
+}
+
+void loop()
+{
+  bool state = digitalRead(BOOT_BTN);
+  if (state == LOW && lastState == HIGH)
+  {            
+    delay(30); 
+    if (digitalRead(BOOT_BTN) == LOW)
+    { 
+      Serial.println("Button pressed!");
+    }
+  }
+  lastState = state;
+
+  static wl_status_t lastStatus = WL_IDLE_STATUS;
+  const wl_status_t status = WiFi.status();
+
+  if (status != lastStatus)
+  {
+    Serial.print("[WiFi] Status changed: ");
+    Serial.println(wifiStatusToString(status));
+    lastStatus = status;
+    updateBleStatusCharacteristic(status);
+
+    if (status == WL_CONNECTED)
+    {
+      printNetworkInfo();
+    }
+  }
+  Serial.println("Hello from ESP32!");
+
+  delay(100);
+}
